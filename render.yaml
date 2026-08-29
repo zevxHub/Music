@@ -1,9 +1,11 @@
 services:
-  - type: worker
-    name: discord-shazam-bot
+  - type: web
+    name: music-recognition-bot
     env: python
-    buildCommand: "apt-get update && apt-get install -y ffmpeg && pip install -r requirements.txt"
+    buildCommand: "pip install -r requirements.txt"
     startCommand: "python main.py"
+    aptpackages:
+      - ffmpeg
     envVars:
       - key: DISCORD_TOKEN
         sync: false
