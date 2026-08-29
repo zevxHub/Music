@@ -3,6 +3,7 @@ import asyncio
 import tempfile
 import uuid
 import threading
+import urllib.request
 from pathlib import Path
 
 import discord
@@ -44,8 +45,23 @@ async def on_ready():
     print("------")
 
 # --- STEP 3: Core Audio Processing & Recognition Functions ---
+def expand_url(url: str) -> str:
+    """Follow HTTP redirects for short/mobile links (vm.tiktok.com, m.youtube.com)."""
+    try:
+        req = urllib.request.Request(
+            url, 
+            headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.geturl()
+    except Exception:
+        return url
+
 async def download_audio_from_url(url: str) -> str:
     """Download audio from YouTube, TikTok, Spotify fallback, etc. using yt-dlp."""
+    # 1. Expand short mobile URLs automatically
+    expanded_url = await asyncio.to_thread(expand_url, url)
+
     temp_dir = tempfile.gettempdir()
     file_id = f"temp_{uuid.uuid4()}"
     outtmpl_path = os.path.join(temp_dir, file_id)
@@ -58,11 +74,11 @@ async def download_audio_from_url(url: str) -> str:
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": False,
-        "default_search": "auto",
-        # Pass realistic headers & extractor args for TikTok
+        # Falls back to YouTube search if a Spotify or Apple Music link is provided
+        "default_search": "ytsearch",
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.5",
             "Referer": "https://www.tiktok.com/",
         },
@@ -77,10 +93,15 @@ async def download_audio_from_url(url: str) -> str:
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }],
+        # Trims track to first 15s to remove intro noise and improve Shazam detection rate
+        "postprocessor_args": {
+            "ffmpeg": ["-ss", "00:00:00", "-t", "15"]
+        }
     }
+
     def _download():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+            ydl.download([expanded_url])
 
     try:
         await asyncio.to_thread(_download)
