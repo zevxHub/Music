@@ -59,13 +59,25 @@ async def download_audio_from_url(url: str) -> str:
         "no_warnings": True,
         "ignoreerrors": False,
         "default_search": "auto",
+        # Pass realistic headers & extractor args for TikTok
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": "https://www.tiktok.com/",
+        },
+        "extractor_args": {
+            "tiktok": {
+                "app_version": "20.2.1",
+                "manifest_app_version": "2021",
+            }
+        },
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }],
     }
-
     def _download():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
