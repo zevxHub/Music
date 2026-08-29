@@ -1,0 +1,9 @@
+services:
+  - type: worker
+    name: discord-shazam-bot
+    env: python
+    buildCommand: "apt-get update && apt-get install -y ffmpeg && pip install -r requirements.txt"
+    startCommand: "python main.py"
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
