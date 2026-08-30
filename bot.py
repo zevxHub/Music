@@ -3,7 +3,7 @@ import asyncio
 import tempfile
 import uuid
 import threading
-import urllib.request
+import subprocess
 from pathlib import Path
 
 import discord
@@ -13,7 +13,7 @@ import yt_dlp
 from shazamio import Shazam
 from flask import Flask
 
-# --- STEP 1: Flask Keep-Alive Server for Render Free Web Service ---
+# --- Flask Keep-Alive for Render ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -24,10 +24,9 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
-# Run Flask in a background thread so Render marks the service as Healthy
 threading.Thread(target=run_flask, daemon=True).start()
 
-# --- STEP 2: Bot Setup ---
+# --- Bot Setup ---
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
@@ -44,24 +43,13 @@ async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print("------")
 
-# --- STEP 3: Core Audio Processing & Recognition Functions ---
-def expand_url(url: str) -> str:
-    """Follow HTTP redirects for short/mobile links (vm.tiktok.com, m.youtube.com)."""
-    try:
-        req = urllib.request.Request(
-            url, 
-            headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15"}
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.geturl()
-    except Exception:
-        return url
+# --- Core Audio Processing ---
 
 async def download_audio_from_url(url: str) -> str:
-    """Download audio from YouTube, TikTok, Spotify fallback, etc. using yt-dlp."""
-    # 1. Expand short mobile URLs automatically
-    expanded_url = await asyncio.to_thread(expand_url, url)
-
+    """
+    Download the full audio from any media URL using yt-dlp.
+    Returns the path to the downloaded MP3 file.
+    """
     temp_dir = tempfile.gettempdir()
     file_id = f"temp_{uuid.uuid4()}"
     outtmpl_path = os.path.join(temp_dir, file_id)
@@ -74,8 +62,7 @@ async def download_audio_from_url(url: str) -> str:
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": False,
-        # Falls back to YouTube search if a Spotify or Apple Music link is provided
-        "default_search": "ytsearch",
+        "default_search": "ytsearch",          # Fallback for Spotify/Apple Music
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "*/*",
@@ -93,15 +80,12 @@ async def download_audio_from_url(url: str) -> str:
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }],
-        # Trims track to first 15s to remove intro noise and improve Shazam detection rate
-        "postprocessor_args": {
-            "ffmpeg": ["-ss", "00:00:00", "-t", "15"]
-        }
+        # No trimming here – we'll do it later for multiple attempts
     }
 
     def _download():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([expanded_url])
+            ydl.download([url])
 
     try:
         await asyncio.to_thread(_download)
@@ -112,19 +96,72 @@ async def download_audio_from_url(url: str) -> str:
 
     if not os.path.exists(final_output_path):
         raise RuntimeError("yt-dlp did not produce an audio file")
-
     return final_output_path
 
-async def recognize_audio(file_path: str):
-    """Pass audio track to Shazam engine."""
+async def trim_audio(input_path: str, start_sec: int, duration_sec: int, output_path: str) -> bool:
+    """
+    Use ffmpeg to extract a segment from input_path and save to output_path.
+    Returns True on success.
+    """
     try:
-        result = await shazam.recognize(file_path)
+        cmd = [
+            "ffmpeg",
+            "-y",                     # overwrite output
+            "-i", input_path,
+            "-ss", str(start_sec),
+            "-t", str(duration_sec),
+            "-acodec", "copy",        # keep quality
+            output_path
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        await process.communicate()
+        return process.returncode == 0 and os.path.exists(output_path)
+    except Exception:
+        return False
+
+async def recognize_segment(file_path: str, start_sec: int, duration_sec: int) -> dict:
+    """
+    Trim the given audio file to a segment, recognize it with Shazam.
+    Returns the result dict if recognised, else None.
+    The trimmed file is deleted after recognition.
+    """
+    temp_dir = tempfile.gettempdir()
+    segment_path = os.path.join(temp_dir, f"segment_{uuid.uuid4()}.mp3")
+    try:
+        success = await trim_audio(file_path, start_sec, duration_sec, segment_path)
+        if not success:
+            return None
+        # Recognize
+        result = await shazam.recognize(segment_path)
         return result
     except Exception:
         return None
+    finally:
+        if os.path.exists(segment_path):
+            os.remove(segment_path)
+
+async def recognize_audio_with_retry(file_path: str) -> dict:
+    """
+    Attempt to recognise the audio by testing several segments.
+    Returns the first successful result, or None if all fail.
+    """
+    # Try a few different segments (start, duration) in seconds
+    attempts = [
+        (0, 15),     # beginning
+        (15, 15),    # a bit later
+        (30, 15),    # further in
+    ]
+    for start, duration in attempts:
+        result = await recognize_segment(file_path, start, duration)
+        if result and "track" in result:
+            return result
+    return None
 
 def build_embed(result: dict) -> discord.Embed:
-    """Construct a formatted Discord embed for song results."""
     track = result.get("track", {})
     title = track.get("title", "Unknown Title")
     artist = track.get("subtitle", "Unknown Artist")
@@ -141,7 +178,8 @@ def build_embed(result: dict) -> discord.Embed:
         embed.set_thumbnail(url=cover_url)
     return embed
 
-# --- STEP 4: Music Recognition Command ---
+# --- Command ---
+
 @bot.command(name="whatsong", aliases=["recognize"])
 async def whatsong(ctx: commands.Context, *, url: str = None):
     source_url = url
@@ -170,7 +208,7 @@ async def whatsong(ctx: commands.Context, *, url: str = None):
             await attachment.save(file_path)
 
         await ctx.reply("🔍 Analyzing song signature with Shazam...")
-        result = await recognize_audio(file_path)
+        result = await recognize_audio_with_retry(file_path)
 
         if result and "track" in result:
             embed = build_embed(result)
@@ -182,7 +220,7 @@ async def whatsong(ctx: commands.Context, *, url: str = None):
         await ctx.reply(f"❌ An error occurred: {str(e)}")
 
     finally:
-        # Always purge temporary local audio file
+        # Clean up the main downloaded file
         if file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
@@ -190,6 +228,7 @@ async def whatsong(ctx: commands.Context, *, url: str = None):
             except Exception as cleanup_error:
                 print(f"Failed to delete {file_path}: {cleanup_error}")
 
-# --- STEP 5: Start Execution ---
+# --- Start ---
+
 if __name__ == "__main__":
     bot.run(TOKEN)
